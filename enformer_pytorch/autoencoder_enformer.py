@@ -14,7 +14,7 @@ from enformer_pytorch.data import str_to_one_hot, seq_indices_to_one_hot
 
 from enformer_pytorch.config_enformer import EnformerConfig
 
-from transformers import PreTrainedModel
+from transformers import PreTrainedself
 
 # constants
 
@@ -292,16 +292,88 @@ class Attention(nn.Module):
         out = einsum('b h i j, b h j d -> b h i d', attn, v)
         out = rearrange(out, 'b h n d -> b n (h d)')
         return self.to_out(out)
+    
+class Encoder(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        half_dim = config.dim // 2
+
+        filter_list = exponential_linspace_int(half_dim, config.dim,
+                                             num=(config.num_downsamples - 1),
+                                             divisible_by=config.dim_divisible_by)
+        filter_list = [half_dim, *filter_list]
+
+        encoder_layers = []
+        for dim_in, dim_out in zip(filter_list[:-1], filter_list[1:]):
+            encoder_layers.append(nn.Sequential(
+                ConvBlock(dim_in, dim_out, kernel_size=5),
+                Residual(ConvBlock(dim_out, dim_out, 1)),
+                AttentionPool(dim_out, pool_size=2)
+            ))
+
+        self.encoder_layers = nn.Sequential(*encoder_layers)
+
+        # Add multi-head attention layer
+        self.attention = Attention(
+            dim=filter_list[-1],
+            heads=8,
+            dim_key=64,
+            dim_value=filter_list[-1] // 8,
+            num_rel_pos_features=filter_list[-1] // 8
+        )
+
+    def forward(self, x):
+        x = self.encoder_layers(x)
+        x = rearrange(x, 'b d n -> b n d')
+        x = self.attention(x)
+        return x
+
+class Decoder(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        half_dim = config.dim // 2
+
+        filter_list = exponential_linspace_int(half_dim, config.dim,
+                                             num=(config.num_downsamples - 1),
+                                             divisible_by=config.dim_divisible_by)
+        filter_list = [half_dim, *filter_list]
+
+        # Add multi-head attention layer
+        self.attention = Attention(
+            dim=filter_list[-1],
+            heads=8,
+            dim_key=64,
+            dim_value=filter_list[-1] // 8,
+            num_rel_pos_features=filter_list[-1] // 8
+        )
+
+        decoder_layers = []
+        reversed_filters = list(reversed(filter_list))
+        for dim_in, dim_out in zip(reversed_filters[:-1], reversed_filters[1:]):
+            decoder_layers.append(nn.Sequential(
+                nn.Upsample(scale_factor=2, mode='nearest'),
+                ConvBlock(dim_in, dim_out, kernel_size=5),
+                Residual(ConvBlock(dim_out, dim_out, 1))
+            ))
+
+        self.decoder_layers = nn.Sequential(*decoder_layers)
+
+    def forward(self, x):
+        x = self.attention(x)
+        x = rearrange(x, 'b n d -> b d n')
+        x = self.decoder_layers(x)
+        return x
 
 # main class
 
-class Enformer(PreTrainedModel):
+
+class ShallowEnformer(PreTrainedModel):
     config_class = EnformerConfig
-    base_model_prefix = "enformer"
+    base_self_prefix = "enformer"
 
     @staticmethod
     def from_hparams(**kwargs):
-        return Enformer(EnformerConfig(**kwargs))
+        return ShallowEnformer(EnformerConfig(**kwargs))
 
     def __init__(self, config):
         super().__init__(config)
@@ -322,15 +394,8 @@ class Enformer(PreTrainedModel):
         filter_list = exponential_linspace_int(half_dim, config.dim, num = (config.num_downsamples - 1), divisible_by = config.dim_divisible_by)
         filter_list = [half_dim, *filter_list]
 
-        conv_layers = []
-        for dim_in, dim_out in zip(filter_list[:-1], filter_list[1:]):
-            conv_layers.append(nn.Sequential(
-                ConvBlock(dim_in, dim_out, kernel_size = 5),
-                Residual(ConvBlock(dim_out, dim_out, 1)),
-                AttentionPool(dim_out, pool_size = 2)
-            ))
-
-        self.conv_tower = nn.Sequential(*conv_layers)
+        self.encoder = Encoder(config)
+        self.decoder = Decoder(config)
 
         # whether to use tensorflow gamma positions
 
@@ -388,7 +453,7 @@ class Enformer(PreTrainedModel):
         self._trunk = nn.Sequential(
             Rearrange('b n d -> b d n'),
             self.stem,
-            self.conv_tower,
+            self.encoder,
             Rearrange('b d n -> b n d'),
             self.transformer,
             self.crop_final,
@@ -426,7 +491,7 @@ class Enformer(PreTrainedModel):
     def trunk_checkpointed(self, x):
         x = rearrange(x, 'b n d -> b d n')
         x = self.stem(x)
-        x = self.conv_tower(x)
+        x = self.encoder(x)
         x = rearrange(x, 'b d n -> b n d')
         x = checkpoint_sequential(self.transformer, len(self.transformer), x)
         x = self.crop_final(x)
